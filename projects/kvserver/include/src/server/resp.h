@@ -19,11 +19,20 @@ enum RESP_SYMBOLS {
 struct RESP_RESULT {
     RESP_STATUS status{RESP_OK};
     std::vector<std::string> commands;
-    int muilti_bulk_length{0}; // 命令条数
+    int multi_bulk_length{0}; // 命令条数
+    size_t offset{0}; // 已经解析的字节数,仅当 status 为 OK 时有效，如果 长度 != input_buffer.length()，说明有粘包
+};
+
+struct RESP_MULTI_RESULT {
+    RESP_STATUS status{RESP_OK};
+    std::vector<RESP_RESULT> commands;
 };
 
 #define MULTI_BULK_LENGTH_MAX 32 // 命令条数最大值
 #define BULK_STRING_LENGTH_MAX 1024 // 命令长度最大值
 
 int str_to_int(const std::string& str);
+
 RESP_RESULT parse_command(const std::string& input_buffer);
+
+RESP_MULTI_RESULT parse_commands(std::string& input_buffer);
