@@ -182,6 +182,8 @@ offset 0    4     8    11    13    17    21    23   27    30
 - 未知命令:命令名小写 → `-ERR unknown command '<命令名>'\r\n`
   (真 Redis 在后面还会带参数列表;我们 v1 省略,不影响 redis-cli 识别)
 - 类型不对(对非字符串键做 INCR/APPEND 等,以后有非字符串类型时用)→ `-WRONGTYPE Operation against a key holding the wrong kind of value\r\n`
+- 协议错误(字节流解不成命令,如开头不是 `*`、bulk 长度对不上)→ `-ERR Protocol error: invalid request\r\n`
+  (真 Redis 会按具体原因细分文本,如 `invalid multibulk length`/`expected '$', got ...`;我们的解析器把所有失败压成一个 `RESP_ERR`、不报告原因,故用一个通用文本。将来解析层若加"失败原因"字段,可把 `*`-开头的坏数组对拍到字节级。真 Redis 对不以 `*` 开头的文本当 inline 命令处理,我们不做 inline,属范围差异——见 introduce.md)
 
 **我们 v1 的已知简化**(真 Redis 支持、我们暂时只做子集,单测里按简化断言):
 - `PING` 真 Redis 允许多带一个消息参数并回显(bulk);我们只做无参版,多参报错;
