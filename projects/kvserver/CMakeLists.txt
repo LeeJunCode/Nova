@@ -5,15 +5,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 # 添加可执行文件
 add_executable(kvserver src/main.cpp)
+
 add_executable(kvserver_tests
+    src/server/resp.cpp
+    src/server/store.cpp
+
     tests/test_main.cpp
     tests/test_more.cpp
-    src/server/resp.cpp
     tests/test_resp.cpp
+    tests/test_store.cpp
 )
+
 add_executable(kvserver_server
-    src/server/server.cpp
     src/server/resp.cpp
+
+    src/server/server.cpp
 )
 
 # 添加 include 目录
