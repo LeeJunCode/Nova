@@ -13,7 +13,7 @@ enum RESP_STATUS {
 struct RESP_RESULT {
     RESP_STATUS status{RESP_OK};
     std::vector<std::string> argv; // 这条命令的词:argv[0]=命令名,argv[1..]=参数(解析层只切词、不分词义)
-    int argc{0}; // 命令含有的词个数
+    long long argc{0}; // 命令含有的词个数
     size_t offset{0}; // 本条命令占的字节数,仅 status==OK 时有效;若 != querybuf.length() 说明后面还有(粘包)
 };
 
@@ -26,7 +26,7 @@ struct RESP_MULTI_RESULT {
 #define ARGC_MAX 32 // 单条命令的词个数上限
 #define BULK_STRING_LENGTH_MAX 1024 // 单个词长度上限
 
-int str_to_int(const std::string& str);
+bool parse_ll(const std::string& s, long long& out);
 
 // 解析一条完整命令
 RESP_RESULT parse_command(const std::string& querybuf);
@@ -49,6 +49,8 @@ inline std::string encode_error(const std::string& msg) {
 inline std::string encode_null_bulk() {
     return "$-1\r\n";
 }
+// 对整数编码
+std::string encode_integer(const long long number);
 
 class Store; // build_reply 要用到存储，前向声明一下
 // 分发器

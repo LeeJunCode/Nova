@@ -26,3 +26,7 @@ add_executable(kvserver_server
 # 添加 include 目录
 target_include_directories(kvserver_tests PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_include_directories(kvserver_server PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+# 打开编译警告
+target_compile_options(kvserver_tests PRIVATE -Wall -Wextra)
+target_compile_options(kvserver_server PRIVATE -Wall -Wextra)

@@ -4,20 +4,26 @@
 #include <climits>
 #include <cctype>
 
-int str_to_int(const std::string& str) {
-    int result = 0;
-    for (char c : str) {
-        if (c < '0' || c > '9') {
-            return -1;
+bool parse_ll(const std::string& s, long long& out) {
+    if (s.size() == 0) return false;
+    out = 0;
+    size_t i = 0;
+    if (s[0] == '-') ++i;
+    for (;i<s.size(); ++i) {
+        if (s[i] < '0' || s[i] > '9') {
+            return false;
         }
-        if (result > INT_MAX / 10) { // 防止溢出
-            return -1;
-        } else if (result == INT_MAX / 10 && c - '0' > INT_MAX % 10) { // 防止溢出
-            return -1;
+        if (out < (LLONG_MIN + (s[i] - '0')) / 10) { // 防止溢出
+            return false;
         }
-        result = result * 10 + (c - '0');
+        out = out * 10 - (s[i] - '0'); // 从负数空间累加，防止 LLONG_MIN 绝对值超过 LLONG_MAX 而提前溢出
     }
-    return result;
+    if (s[0] != '-') {
+        if (out == LLONG_MIN) return false;
+        out = 0 - out;
+    }
+
+    return true;
 }
 
 RESP_RESULT parse_command(const std::string& querybuf) {
@@ -46,14 +52,15 @@ RESP_RESULT parse_command(const std::string& querybuf) {
         return resp_result;
     }
     std::string argc_str = querybuf.substr(1, querybuf.find("\r\n") - 1);
-    resp_result.argc = str_to_int(argc_str);
-    // argc 非法:0 = 空数组(没有命令名),-1 = 头部不是数字
-    if (resp_result.argc == -1 || resp_result.argc == 0) {
+    long long out;
+    // argc 非法
+    if (!parse_ll(argc_str, out)) {
         resp_result.status = RESP_STATUS::RESP_ERR;
         return resp_result;
     }
-    // 词个数超过上限
-    if (resp_result.argc > ARGC_MAX) {
+    resp_result.argc = out;
+    // 词个数超过上限和下限
+    if (resp_result.argc > ARGC_MAX || resp_result.argc <= 0) {
         resp_result.status = RESP_STATUS::RESP_ERR;
         return resp_result;
     }
@@ -73,19 +80,19 @@ RESP_RESULT parse_command(const std::string& querybuf) {
                 return resp_result;
             }
             std::string bulk_length_str = querybuf.substr(it - querybuf.cbegin() + 1, querybuf.find("\r\n", it - querybuf.cbegin()) - (it - querybuf.cbegin() + 1));
-            int bulk_length = str_to_int(bulk_length_str);
-            if (bulk_length == -1) {
+            long long bulk_length;
+            if (!parse_ll(bulk_length_str, bulk_length)) {
                 resp_result.status = RESP_STATUS::RESP_ERR;
                 return resp_result;
             }
-            if (bulk_length > BULK_STRING_LENGTH_MAX) { // 词内容长度超过上限
+            if (bulk_length > BULK_STRING_LENGTH_MAX || bulk_length < 0) { // 词内容长度超过上限和下限
                 resp_result.status = RESP_STATUS::RESP_ERR;
                 return resp_result;
             }
             it += bulk_length_str.length() + 3; // 跳过 $<length>\r\n
 
             // 取词内容
-            if (querybuf.length() < (it - querybuf.cbegin()) + bulk_length + 2) { // 内容不完整，可能是半包
+            if (querybuf.length() < static_cast<size_t>(it - querybuf.cbegin()) + static_cast<size_t>(bulk_length) + 2) { // 内容不完整，可能是半包
                 resp_result.status = RESP_STATUS::RESP_HALF_PACKET;
                 return resp_result;
             }
@@ -147,6 +154,15 @@ std::string encode_bulk_string(const std::string& bulk) {
     return encode_bulk;
 }
 
+// 对整数编码
+std::string encode_integer(const long long number) {
+    std::string number_str;
+    number_str.push_back(':');
+    number_str += std::to_string(number);
+    number_str += "\r\n";
+    return number_str;
+}
+
 // 分发器
 std::string build_reply(const std::vector<std::string>& argv, Store& store) {
     // 转小写
@@ -190,6 +206,132 @@ std::string build_reply(const std::vector<std::string>& argv, Store& store) {
         store.set(argv[1], argv[2]);
         std::string ok("OK");
         return encode_simple_string(ok);
+    } else if (command_name == "del") {
+        if (argv.size() < 2) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        int del_num = 0;
+        for (size_t i=1; i<argv.size(); ++i) {
+            if (store.erase(argv[i])) ++del_num;
+        }
+        return encode_integer(del_num);
+    } else if (command_name == "exists") {
+        if (argv.size() < 2) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        int exists_num = 0;
+        for (size_t i=1; i<argv.size(); ++i) {
+            if (store.exists(argv[i])) ++exists_num;
+        }
+        return encode_integer(exists_num);
+    } else if (command_name == "incr") {
+        if (argv.size() != 2) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        std::string old_str;
+        long long old;
+        if (!store.get(argv[1], old_str)) {
+            old = 0;
+        } else {
+            if (!parse_ll(old_str, old)) {
+                std::string wrong_num_msg = "ERR value is not an integer or out of range";
+                return encode_error(wrong_num_msg);
+            }
+        }
+        if (old > LLONG_MAX - 1) {
+            std::string wrong_num_msg = "ERR increment or decrement would overflow";
+            return encode_error(wrong_num_msg);
+        }
+        old += 1;
+        store.set(argv[1], std::to_string(old));
+        return encode_integer(old);
+    } else if (command_name == "decr") {
+        if (argv.size() != 2) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        std::string old_str;
+        long long old;
+        if (!store.get(argv[1], old_str)) {
+            old = 0;
+        } else {
+            if (!parse_ll(old_str, old)) {
+                std::string wrong_num_msg = "ERR value is not an integer or out of range";
+                return encode_error(wrong_num_msg);
+            }
+        }
+        if (old < LLONG_MIN + 1) {
+            std::string wrong_num_msg = "ERR increment or decrement would overflow";
+            return encode_error(wrong_num_msg);
+        }
+        old -= 1;
+        store.set(argv[1], std::to_string(old));
+        return encode_integer(old);
+    } else if (command_name == "incrby") {
+        if (argv.size() != 3) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        std::string old_str;
+        long long old;
+        if (!store.get(argv[1], old_str)) {
+            old = 0;
+        } else {
+            if (!parse_ll(old_str, old)) {
+                std::string wrong_num_msg = "ERR value is not an integer or out of range";
+                return encode_error(wrong_num_msg);
+            }
+        }
+        long long delta;
+        if (!parse_ll(argv[2], delta)) {
+            std::string wrong_num_msg = "ERR value is not an integer or out of range";
+            return encode_error(wrong_num_msg);
+        }
+        if (delta > 0 && old > LLONG_MAX - delta) {
+            std::string wrong_num_msg = "ERR increment or decrement would overflow";
+            return encode_error(wrong_num_msg);
+        }
+        if (delta < 0 && old < LLONG_MIN - delta) {
+            std::string wrong_num_msg = "ERR increment or decrement would overflow";
+            return encode_error(wrong_num_msg);
+        }
+        old += delta;
+        store.set(argv[1], std::to_string(old));
+        return encode_integer(old);
+    } else if (command_name == "decrby") {
+        if (argv.size() != 3) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        std::string old_str;
+        long long old;
+        if (!store.get(argv[1], old_str)) {
+            old = 0;
+        } else {
+            if (!parse_ll(old_str, old)) {
+                std::string wrong_num_msg = "ERR value is not an integer or out of range";
+                return encode_error(wrong_num_msg);
+            }
+        }
+        long long delta;
+        if (!parse_ll(argv[2], delta)) {
+            std::string wrong_num_msg = "ERR value is not an integer or out of range";
+            return encode_error(wrong_num_msg);
+        }
+        if (delta > 0 && old < LLONG_MIN + delta) {
+            std::string wrong_num_msg = "ERR increment or decrement would overflow";
+            return encode_error(wrong_num_msg);
+        }
+        if (delta < 0 && old > LLONG_MAX + delta) {
+            std::string wrong_num_msg = "ERR increment or decrement would overflow";
+            return encode_error(wrong_num_msg);
+        }
+        old -= delta;
+        store.set(argv[1], std::to_string(old));
+        return encode_integer(old);
     } else {
         std::string unknown_msg = "ERR unknown command '" + command_name + "'";
         return encode_error(unknown_msg);
