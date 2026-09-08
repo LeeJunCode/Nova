@@ -1,4 +1,5 @@
 #include "src/server/resp.h"
+#include "src/server/store.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -38,6 +39,10 @@ int main() {
     } else {
         std::cout << "listening on port 8080..." << std::endl;
     }
+
+    // 维护一个kv存储
+    Store store;
+
     while(1) {
         // accept() 阻塞
         struct sockaddr_in client_addr; // 客户端地址
@@ -74,7 +79,7 @@ int main() {
             // 构建返回结果
             std::string response;
             for (const auto& resp_result : result.commands) {
-                response += build_reply(resp_result.argv);
+                response += build_reply(resp_result.argv, store);
             }
 
             // 解析出现错误，添加错误信息

@@ -1,5 +1,6 @@
 #include "tests/test_kit.h"
 #include "src/server/resp.h"
+#include "src/server/store.h"
 
 TEST(resp, parse_command) {
     // 测试解析命令:一个数组 = 一条命令 = 两个词
@@ -97,39 +98,54 @@ TEST(resp, resp_commands_half) {
     CHECK(querybuf == "*1\r\n$4\r\nECHO");
 }
 
-TEST(resp, resp_build_reply) {
-    std::string querybuf = "*1\r\n$4\r\nPING\r\n"; // "PING"
-    RESP_MULTI_RESULT result = parse_multi_command(querybuf);
-    std::string reply = build_reply(result.commands[0].argv);
-    CHECK(reply == "+PONG\r\n");
+TEST(resp, resp_build_reply_ping_echo) {
+    // 分发器测试直接喂词表:build_reply 收的是 argv,不经过 RESP 线帧。
+    // {…} 花括号列表会构造一个临时 vector,绑定到 const 引用参数上。
+    Store store;
+    CHECK(build_reply({"PING"}, store) == "+PONG\r\n");
+    CHECK(build_reply({"PING", "X"}, store) == "-ERR wrong number of arguments for 'ping' command\r\n");
+    CHECK(build_reply({"ECHO", "hi"}, store) == "$2\r\nhi\r\n");
+    CHECK(build_reply({"ECHO", ""}, store) == "$0\r\n\r\n");       // 值空串回 $0
+    CHECK(build_reply({"EcHo", "Hi"}, store) == "$2\r\nHi\r\n");   // 命令名大小写不敏感
+    CHECK(build_reply({"ECHO"}, store) == "-ERR wrong number of arguments for 'echo' command\r\n");
+}
 
-    querybuf = "*2\r\n$4\r\nPING\r\n$1\r\nX\r\n"; // "PING X"
-    result = parse_multi_command(querybuf);
-    reply = build_reply(result.commands[0].argv);
-    CHECK(reply == "-ERR wrong number of arguments for 'ping' command\r\n");
+TEST(resp, resp_build_reply_set_get) {
+    Store store;
+    CHECK(build_reply({"set", "a", "b"}, store) == "+OK\r\n");
+    CHECK(build_reply({"get", "a"}, store) == "$1\r\nb\r\n");
 
-    querybuf = "*1\r\n$4\r\nECHO\r\n"; // "ECHO"
-    result = parse_multi_command(querybuf);
-    reply = build_reply(result.commands[0].argv);
-    CHECK(reply == "-ERR wrong number of arguments for 'echo' command\r\n");
+    // GET 缺键(null bulk $−1)与值空串($0)字节必须不同;缺键不是错误。
+    CHECK(build_reply({"get", "nosuch"}, store) == "$-1\r\n");
+    CHECK(build_reply({"set", "e", ""}, store) == "+OK\r\n");
+    CHECK(build_reply({"get", "e"}, store) == "$0\r\n\r\n");
 
-    querybuf = "*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n"; // "ECHO hi"
-    result = parse_multi_command(querybuf);
-    reply = build_reply(result.commands[0].argv);
-    CHECK(reply == "$2\r\nhi\r\n");
+    // arity:set 严格 3 词、get 严格 2 词
+    CHECK(build_reply({"set", "a"}, store) == "-ERR wrong number of arguments for 'set' command\r\n");
+    CHECK(build_reply({"set", "a", "b", "c"}, store) == "-ERR wrong number of arguments for 'set' command\r\n");
+    CHECK(build_reply({"get"}, store) == "-ERR wrong number of arguments for 'get' command\r\n");
 
-    querybuf = "*2\r\n$4\r\nECHO\r\n$0\r\n\r\n"; // "ECHO "
-    result = parse_multi_command(querybuf);
-    reply = build_reply(result.commands[0].argv);
-    CHECK(reply == "$0\r\n\r\n");
+    // 未知命令
+    CHECK(build_reply({"frobnicate"}, store) == "-ERR unknown command 'frobnicate'\r\n");
 
-    querybuf = "*3\r\n$3\r\nset\r\n$1\r\na\r\n$1\r\nb\r\n"; // "set a b"
-    result = parse_multi_command(querybuf);
-    reply = build_reply(result.commands[0].argv);
-    CHECK(reply == "-ERR unknown command 'set'\r\n");
+    // 键区分大小写:A 与 a 是两个不同的 key
+    CHECK(build_reply({"set", "A", "upper"}, store) == "+OK\r\n");
+    CHECK(build_reply({"get", "A"}, store) == "$5\r\nupper\r\n");
+    CHECK(build_reply({"get", "a"}, store) == "$1\r\nb\r\n");      // a 仍是最早 set 的 b
+}
 
-    querybuf = "*2\r\n$4\r\nEcHo\r\n$2\r\nHi\r\n"; // "EcHo Hi"
-    result = parse_multi_command(querybuf);
-    reply = build_reply(result.commands[0].argv);
-    CHECK(reply == "$2\r\nHi\r\n");
+TEST(resp, resp_build_reply_via_parse) {
+    // 模拟 server.cpp 真实路径:线帧 → parse_multi_command → 逐条 build_reply
+    Store store;
+    std::string buf = "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\nb\r\n*2\r\n$3\r\nGET\r\n$1\r\na\r\n";
+    RESP_MULTI_RESULT result = parse_multi_command(buf);
+    CHECK(result.status == RESP_STATUS::RESP_OK);
+    CHECK(result.commands.size() == 2); // 粘包:SET a b + GET a 两条一起榨干
+    CHECK(build_reply(result.commands[0].argv, store) == "+OK\r\n");
+    CHECK(build_reply(result.commands[1].argv, store) == "$1\r\nb\r\n");
+
+    std::string buf2 = "*2\r\n$3\r\nGET\r\n$6\r\nnosuch\r\n";
+    result = parse_multi_command(buf2);
+    CHECK(result.commands.size() == 1);
+    CHECK(build_reply(result.commands[0].argv, store) == "$-1\r\n"); // nosuch 没存过 → null bulk
 }

@@ -45,6 +45,11 @@ inline std::string encode_simple_string(const std::string& simple) {
 inline std::string encode_error(const std::string& msg) {
     return "-" + msg + "\r\n";
 }
+// 对空词编码
+inline std::string encode_null_bulk() {
+    return "$-1\r\n";
+}
 
+class Store; // build_reply 要用到存储，前向声明一下
 // 分发器
-std::string build_reply(const std::vector<std::string>& argv);
+std::string build_reply(const std::vector<std::string>& argv, Store& store);

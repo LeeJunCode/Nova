@@ -1,4 +1,6 @@
 #include "src/server/resp.h"
+#include "src/server/store.h"
+
 #include <climits>
 #include <cctype>
 
@@ -146,7 +148,7 @@ std::string encode_bulk_string(const std::string& bulk) {
 }
 
 // 分发器
-std::string build_reply(const std::vector<std::string>& argv) {
+std::string build_reply(const std::vector<std::string>& argv, Store& store) {
     // 转小写
     auto to_lower = [] (std::string str) {
         for (auto& c : str) {
@@ -169,6 +171,25 @@ std::string build_reply(const std::vector<std::string>& argv) {
         }
         std::string pong("PONG");
         return encode_simple_string(pong);
+    } else if (command_name == "get") {
+        if (argv.size() != 2) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        std::string value;
+        if (store.get(argv[1], value)) {
+            return encode_bulk_string(value);
+        } else {
+            return encode_null_bulk();
+        }
+    } else if (command_name == "set") {
+        if (argv.size() != 3) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        store.set(argv[1], argv[2]);
+        std::string ok("OK");
+        return encode_simple_string(ok);
     } else {
         std::string unknown_msg = "ERR unknown command '" + command_name + "'";
         return encode_error(unknown_msg);

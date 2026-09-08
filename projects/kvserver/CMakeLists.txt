@@ -18,6 +18,7 @@ add_executable(kvserver_tests
 
 add_executable(kvserver_server
     src/server/resp.cpp
+    src/server/store.cpp
 
     src/server/server.cpp
 )
