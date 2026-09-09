@@ -282,3 +282,83 @@ TEST(resp, resp_build_reply_getset_append_strlen) {
     CHECK(build_reply({"getset", "k"}, store) == "-ERR wrong number of arguments for 'getset' command\r\n");
     CHECK(build_reply({"getset", "k", "v", "extra"}, store) == "-ERR wrong number of arguments for 'getset' command\r\n");
 }
+
+// 从 ":N\r\n" 整型回复里抠出 N;不是整型回复则回 LLONG_MIN 哨兵(让 CHECK 失败但能看清是哪个断言)
+static long long int_reply(const std::string& reply) {
+    if (reply.size() < 3 || reply[0] != ':') return LLONG_MIN;
+    long long v;
+    if (!parse_ll(reply.substr(1, reply.size() - 3), v)) return LLONG_MIN;
+    return v;
+}
+
+TEST(resp, resp_build_reply_expire_ttl) {
+    Store store;
+
+    // EXPIRE 缺键 → :0;TTL 缺键 → :-2
+    CHECK(build_reply({"expire", "nosuch", "100"}, store) == ":0\r\n");
+    CHECK(build_reply({"ttl", "nosuch"}, store) == ":-2\r\n");
+
+    // 键在但无期限 → TTL :-1;设期限 → :1,TTL 落在 (0,100] 且 GET 读得到
+    CHECK(build_reply({"set", "k", "v"}, store) == "+OK\r\n");
+    CHECK(build_reply({"ttl", "k"}, store) == ":-1\r\n");
+    CHECK(build_reply({"expire", "k", "100"}, store) == ":1\r\n");
+    long long t = int_reply(build_reply({"ttl", "k"}, store));
+    CHECK(t > 0 && t <= 100);
+    CHECK(build_reply({"get", "k"}, store) == "$1\r\nv\r\n");
+
+    // 再设一次更大的期限 → 覆盖为 ~200s,仍在 (0,200] 而非上次的剩余秒
+    CHECK(build_reply({"expire", "k", "200"}, store) == ":1\r\n");
+    t = int_reply(build_reply({"ttl", "k"}, store));
+    CHECK(t > 100 && t <= 200);
+
+    // EXPIRE 0 / 负数 → 键被删,GET 回 null bulk
+    CHECK(build_reply({"set", "d", "x"}, store) == "+OK\r\n");
+    CHECK(build_reply({"expire", "d", "0"}, store) == ":1\r\n");
+    CHECK(build_reply({"get", "d"}, store) == "$-1\r\n");
+    CHECK(build_reply({"set", "d2", "x"}, store) == "+OK\r\n");
+    CHECK(build_reply({"expire", "d2", "-5"}, store) == ":1\r\n");
+    CHECK(build_reply({"get", "d2"}, store) == "$-1\r\n");
+
+    // 已删键再 EXPIRE → :0
+    CHECK(build_reply({"expire", "d2", "100"}, store) == ":0\r\n");
+
+    // EXPIRE seconds 非整数 → error 句
+    CHECK(build_reply({"expire", "k", "abc"}, store) == "-ERR value is not an integer or out of range\r\n");
+    CHECK(build_reply({"expire", "k", "1.5"}, store) == "-ERR value is not an integer or out of range\r\n");
+
+    // arity:expire 恰好 3 词,ttl 恰好 2 词
+    CHECK(build_reply({"expire", "k"}, store) == "-ERR wrong number of arguments for 'expire' command\r\n");
+    CHECK(build_reply({"expire", "k", "10", "junk"}, store) == "-ERR wrong number of arguments for 'expire' command\r\n");
+    CHECK(build_reply({"ttl"}, store) == "-ERR wrong number of arguments for 'ttl' command\r\n");
+    CHECK(build_reply({"ttl", "k", "junk"}, store) == "-ERR wrong number of arguments for 'ttl' command\r\n");
+}
+
+TEST(resp, resp_build_reply_ttl_split_acceptance) {
+    Store store;
+
+    // 验收点 A:SET(整值替换)应清 TTL
+    CHECK(build_reply({"set", "ka", "1"}, store) == "+OK\r\n");
+    CHECK(build_reply({"expire", "ka", "100"}, store) == ":1\r\n");
+    CHECK(build_reply({"set", "ka", "2"}, store) == "+OK\r\n");
+    CHECK(build_reply({"ttl", "ka"}, store) == ":-1\r\n"); // TTL 被清掉了
+
+    // 验收点 B:GETSET 同样整值替换 → 清 TTL(旧值能读回)
+    CHECK(build_reply({"set", "kb", "1"}, store) == "+OK\r\n");
+    CHECK(build_reply({"expire", "kb", "100"}, store) == ":1\r\n");
+    CHECK(build_reply({"getset", "kb", "9"}, store) == "$1\r\n1\r\n");
+    CHECK(build_reply({"ttl", "kb"}, store) == ":-1\r\n"); // TTL 被清掉了
+
+    // 验收点 C:INCR 就地改值 → 保留 TTL
+    CHECK(build_reply({"set", "kc", "5"}, store) == "+OK\r\n");
+    CHECK(build_reply({"expire", "kc", "100"}, store) == ":1\r\n");
+    CHECK(build_reply({"incr", "kc"}, store) == ":6\r\n");
+    long long t = int_reply(build_reply({"ttl", "kc"}, store));
+    CHECK(t > 0 && t <= 100); // TTL 仍在,只是过了微秒
+
+    // 验收点 D:APPEND 就地改值 → 保留 TTL
+    CHECK(build_reply({"set", "kd", "hello"}, store) == "+OK\r\n");
+    CHECK(build_reply({"expire", "kd", "100"}, store) == ":1\r\n");
+    CHECK(build_reply({"append", "kd", " world"}, store) == ":11\r\n");
+    t = int_reply(build_reply({"ttl", "kd"}, store));
+    CHECK(t > 0 && t <= 100); // TTL 仍在
+}

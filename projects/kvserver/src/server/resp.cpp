@@ -163,6 +163,44 @@ std::string encode_integer(const long long number) {
     return number_str;
 }
 
+// ---- 计数器加减原语(INCR/DECR/INCRBY/DECRBY 共用)----
+// 越界只会发生在同号相加:两数一正一负,结果被夹在两者之间,必然不越界。
+// 所以每条守卫只查"可能越界的那一极",且配合 b 的符号,守卫表达式自身不会溢出。
+// 返回 false = 结果超出 long long,out 不被修改;true = 结果已写入 out。
+static bool checked_add(long long a, long long b, long long& out) {
+    if (b > 0 && a > LLONG_MAX - b) return false; // 同正:顶破上限
+    if (b < 0 && a < LLONG_MIN - b) return false; // 同负:跌穿下限
+    out = a + b;
+    return true;
+}
+
+static bool checked_sub(long long a, long long b, long long& out) {
+    if (b < 0 && a > LLONG_MAX + b) return false; // 减负 = 加 |b|,可能顶破上限
+    if (b > 0 && a < LLONG_MIN + b) return false; // 减正:可能跌穿下限
+    out = a - b;
+    return true;
+}
+
+// 计数器共用核心:读旧值(缺键当 0)→ 带溢出检查的加减 → 写回 → 回 :新值。
+// subtract=true 表示减 delta(给 DECR/DECRBY);false 表示加(给 INCR/INCRBY)。
+// DECRBY 走减法原语而非"取负再相加",是为避开 -LLONG_MIN 无法用 long long 表示的坑。
+static std::string counter_reply(Store& store, const std::string& key,
+                                 long long delta, bool subtract) {
+    std::string old_str;
+    long long old;
+    if (!store.get(key, old_str)) {
+        old = 0; // 缺键从 0 起算,和 Redis 一致
+    } else if (!parse_ll(old_str, old)) {
+        return encode_error("ERR value is not an integer or out of range");
+    }
+    bool ok = subtract ? checked_sub(old, delta, old) : checked_add(old, delta, old);
+    if (!ok) {
+        return encode_error("ERR increment or decrement would overflow");
+    }
+    store.set_keep_ttl(key, std::to_string(old));
+    return encode_integer(old);
+}
+
 // 分发器
 std::string build_reply(const std::vector<std::string>& argv, Store& store) {
     // 转小写
@@ -231,107 +269,33 @@ std::string build_reply(const std::vector<std::string>& argv, Store& store) {
             std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
             return encode_error(wrong_num_msg);
         }
-        std::string old_str;
-        long long old;
-        if (!store.get(argv[1], old_str)) {
-            old = 0;
-        } else {
-            if (!parse_ll(old_str, old)) {
-                std::string wrong_num_msg = "ERR value is not an integer or out of range";
-                return encode_error(wrong_num_msg);
-            }
-        }
-        if (old > LLONG_MAX - 1) {
-            std::string wrong_num_msg = "ERR increment or decrement would overflow";
-            return encode_error(wrong_num_msg);
-        }
-        old += 1;
-        store.set(argv[1], std::to_string(old));
-        return encode_integer(old);
+        return counter_reply(store, argv[1], 1, false); // INCR = +1
     } else if (command_name == "decr") {
         if (argv.size() != 2) {
             std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
             return encode_error(wrong_num_msg);
         }
-        std::string old_str;
-        long long old;
-        if (!store.get(argv[1], old_str)) {
-            old = 0;
-        } else {
-            if (!parse_ll(old_str, old)) {
-                std::string wrong_num_msg = "ERR value is not an integer or out of range";
-                return encode_error(wrong_num_msg);
-            }
-        }
-        if (old < LLONG_MIN + 1) {
-            std::string wrong_num_msg = "ERR increment or decrement would overflow";
-            return encode_error(wrong_num_msg);
-        }
-        old -= 1;
-        store.set(argv[1], std::to_string(old));
-        return encode_integer(old);
+        return counter_reply(store, argv[1], 1, true); // DECR = -1
     } else if (command_name == "incrby") {
         if (argv.size() != 3) {
             std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
             return encode_error(wrong_num_msg);
         }
-        std::string old_str;
-        long long old;
-        if (!store.get(argv[1], old_str)) {
-            old = 0;
-        } else {
-            if (!parse_ll(old_str, old)) {
-                std::string wrong_num_msg = "ERR value is not an integer or out of range";
-                return encode_error(wrong_num_msg);
-            }
-        }
         long long delta;
         if (!parse_ll(argv[2], delta)) {
-            std::string wrong_num_msg = "ERR value is not an integer or out of range";
-            return encode_error(wrong_num_msg);
+            return encode_error("ERR value is not an integer or out of range");
         }
-        if (delta > 0 && old > LLONG_MAX - delta) {
-            std::string wrong_num_msg = "ERR increment or decrement would overflow";
-            return encode_error(wrong_num_msg);
-        }
-        if (delta < 0 && old < LLONG_MIN - delta) {
-            std::string wrong_num_msg = "ERR increment or decrement would overflow";
-            return encode_error(wrong_num_msg);
-        }
-        old += delta;
-        store.set(argv[1], std::to_string(old));
-        return encode_integer(old);
+        return counter_reply(store, argv[1], delta, false); // INCRBY = +delta
     } else if (command_name == "decrby") {
         if (argv.size() != 3) {
             std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
             return encode_error(wrong_num_msg);
         }
-        std::string old_str;
-        long long old;
-        if (!store.get(argv[1], old_str)) {
-            old = 0;
-        } else {
-            if (!parse_ll(old_str, old)) {
-                std::string wrong_num_msg = "ERR value is not an integer or out of range";
-                return encode_error(wrong_num_msg);
-            }
-        }
         long long delta;
         if (!parse_ll(argv[2], delta)) {
-            std::string wrong_num_msg = "ERR value is not an integer or out of range";
-            return encode_error(wrong_num_msg);
+            return encode_error("ERR value is not an integer or out of range");
         }
-        if (delta > 0 && old < LLONG_MIN + delta) {
-            std::string wrong_num_msg = "ERR increment or decrement would overflow";
-            return encode_error(wrong_num_msg);
-        }
-        if (delta < 0 && old > LLONG_MAX + delta) {
-            std::string wrong_num_msg = "ERR increment or decrement would overflow";
-            return encode_error(wrong_num_msg);
-        }
-        old -= delta;
-        store.set(argv[1], std::to_string(old));
-        return encode_integer(old);
+        return counter_reply(store, argv[1], delta, true); // DECRBY = -delta(减法原语,不取负)
     } else if (command_name == "getset") {
         if (argv.size() != 3) {
             std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
@@ -350,7 +314,7 @@ std::string build_reply(const std::vector<std::string>& argv, Store& store) {
         std::string old_value;
         store.get(argv[1], old_value);
         old_value += argv[2];
-        store.set(argv[1], old_value);
+        store.set_keep_ttl(argv[1], old_value);
         return encode_integer(old_value.size());
     } else if (command_name == "strlen") {
         if (argv.size() != 2) {
@@ -360,6 +324,22 @@ std::string build_reply(const std::vector<std::string>& argv, Store& store) {
         std::string value;
         store.get(argv[1], value);
         return encode_integer(value.size());
+    } else if (command_name == "expire") {
+        if (argv.size() != 3) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        long long seconds;
+        if (!parse_ll(argv[2], seconds)) {
+            return encode_error("ERR value is not an integer or out of range");
+        }
+        return encode_integer(store.expire(argv[1], seconds) ? 1 : 0);
+    } else if (command_name == "ttl") {
+        if (argv.size() != 2) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        return encode_integer(store.ttl(argv[1]));
     } else {
         std::string unknown_msg = "ERR unknown command '" + command_name + "'";
         return encode_error(unknown_msg);
