@@ -243,3 +243,42 @@ TEST(resp, resp_build_reply_incr_family) {
     CHECK(build_reply({"incrby", "k", "9223372036854775808"}, store) == "-ERR value is not an integer or out of range\r\n");
     CHECK(build_reply({"incrby", "k", "-9223372036854775809"}, store) == "-ERR value is not an integer or out of range\r\n");
 }
+
+TEST(resp, resp_build_reply_getset_append_strlen) {
+    Store store;
+
+    // STRLEN:缺键回 :0(缺键不是错误,统计型命令缺键无歧义)
+    CHECK(build_reply({"strlen", "nosuch"}, store) == ":0\r\n");
+    CHECK(build_reply({"set", "k", "hello"}, store) == "+OK\r\n");
+    CHECK(build_reply({"strlen", "k"}, store) == ":5\r\n"); // 字节长度,不是对象大小
+
+    // STRLEN 空串值也是 :0——但键存在,GET 回 $0 而非 $-1(靠 get 的 bool 区分)
+    CHECK(build_reply({"set", "e", ""}, store) == "+OK\r\n");
+    CHECK(build_reply({"strlen", "e"}, store) == ":0\r\n");
+    CHECK(build_reply({"get", "e"}, store) == "$0\r\n\r\n");
+
+    // APPEND:缺键当空串起拼,回新长度
+    CHECK(build_reply({"append", "a", "def"}, store) == ":3\r\n");
+    CHECK(build_reply({"get", "a"}, store) == "$3\r\ndef\r\n");
+    // 已有值则累加,长度跟着走
+    CHECK(build_reply({"append", "a", "ghi"}, store) == ":6\r\n");
+    CHECK(build_reply({"get", "a"}, store) == "$6\r\ndefghi\r\n");
+    CHECK(build_reply({"append", "k", " world"}, store) == ":11\r\n"); // hello + " world"
+    CHECK(build_reply({"get", "k"}, store) == "$11\r\nhello world\r\n");
+
+    // GETSET:先读后写——第二次能读回第一次存的值("读旧"的铁证)
+    CHECK(build_reply({"getset", "a", "new"}, store) == "$6\r\ndefghi\r\n"); // 旧值 defghi
+    CHECK(build_reply({"get", "a"}, store) == "$3\r\nnew\r\n");
+    // GETSET 缺键回 $-1,但新值已写进去
+    CHECK(build_reply({"getset", "nosuch", "v"}, store) == "$-1\r\n");
+    CHECK(build_reply({"get", "nosuch"}, store) == "$1\r\nv\r\n");
+    // GETSET 旧值是空串 → 键存在,回 $0,不是 $-1 ← ③.6 最易踩的坑
+    CHECK(build_reply({"getset", "e", "x"}, store) == "$0\r\n\r\n");
+    CHECK(build_reply({"get", "e"}, store) == "$1\r\nx\r\n");
+
+    // arity:strlen 恰好 2 词,append/getset 恰好 3 词
+    CHECK(build_reply({"strlen"}, store) == "-ERR wrong number of arguments for 'strlen' command\r\n");
+    CHECK(build_reply({"append", "k"}, store) == "-ERR wrong number of arguments for 'append' command\r\n");
+    CHECK(build_reply({"getset", "k"}, store) == "-ERR wrong number of arguments for 'getset' command\r\n");
+    CHECK(build_reply({"getset", "k", "v", "extra"}, store) == "-ERR wrong number of arguments for 'getset' command\r\n");
+}

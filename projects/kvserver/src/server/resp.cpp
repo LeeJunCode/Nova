@@ -332,6 +332,34 @@ std::string build_reply(const std::vector<std::string>& argv, Store& store) {
         old -= delta;
         store.set(argv[1], std::to_string(old));
         return encode_integer(old);
+    } else if (command_name == "getset") {
+        if (argv.size() != 3) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        std::string old_value;
+        bool found = store.get(argv[1], old_value);
+        store.set(argv[1], argv[2]);
+        if (found) return encode_bulk_string(old_value);
+        return encode_null_bulk();
+    } else if (command_name == "append") {
+        if (argv.size() != 3) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        std::string old_value;
+        store.get(argv[1], old_value);
+        old_value += argv[2];
+        store.set(argv[1], old_value);
+        return encode_integer(old_value.size());
+    } else if (command_name == "strlen") {
+        if (argv.size() != 2) {
+            std::string wrong_num_msg = "ERR wrong number of arguments for '" + command_name + "' command";
+            return encode_error(wrong_num_msg);
+        }
+        std::string value;
+        store.get(argv[1], value);
+        return encode_integer(value.size());
     } else {
         std::string unknown_msg = "ERR unknown command '" + command_name + "'";
         return encode_error(unknown_msg);
