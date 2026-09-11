@@ -92,3 +92,63 @@ Client
     connect()       // 想服务端发起连接请求
     send()/recv()   // 发送/接收数据
     close()         // 关闭 socket
+
+## socket 与 内核
+程序编程使用的函数的交互对象是内核，而不是网络，也不是客户端
+一个 socket 是一个文件描述符，对于一个程序，它创建的 socket 在内核中会创建一张 fd 表
+
+    fd    内核对象
+    1     socket对象（服务器监听用）
+    2     socket对象（一个客户端连接用）
+
+socket、bind、listen、accept、resv、send、close 等函数的操作对象都是那个文件描述符，而具体的操作都是由内核来完成的。函数所执行的读写操作对象也是内核缓冲区，resv是从内核缓冲区中去读数据，send是将数据写到内核缓冲区，数据的接收、发送、tcp连接都是由内核完成。
+
+Server
+
+    // 需要说明的是：不管这个程序是否存在，内核是一直在收包的，也就是哪怕没有编写服务端程序，只要有服务端地址，客户端就可以给服务端发包，在没有 socket 能够进行处理的时候，内核根据 tcp 协议直接回复 RST，这个过程与程序完全无关。
+
+    // 创建一个 fd，即在那张表中添加一个 socket 对象。
+    int socket(int domain, int type, int protocol);
+
+    // 为这个 socket 对象绑定服务端的地址和端口
+    int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+
+    // 告诉内核 这个服务器 socket 开始接客了
+    // 内核做：① socket 状态 = TCP_LISTEN; ② 创建两个队列(SYN 队列 + 全连接队列)
+    // 在开启监听之后，内核就可以建立 tcp 三次握手连接了
+    // 在 listen 代码之后，内核开始进行 tcp 三次握手，过程如下：
+    // 客户端发送 SYN     "SYN=1, Seq=x" 给服务端；                （第一次连接）
+    // 服务端回复 SYN-ACK "SYN=1, ACK=1, Seq=y, Ack=x+1" 给客户端；（第二次连接，内核将其放入 SYN 半连接队列）
+    // 客户端回复 ACK     "ACK=1, Seq=x+1, Ack=y+1" 给服务端；     （第三次连接，至此，tcp连接成功建立，内核将其放入 全连接队列）
+    int listen(int sockfd, int backlog);
+
+    // 正式开始循环接客了
+    // 这里的循环是指循环从全连接队列中去拿一个已经建立连接的客户端对象
+    // 如果全连接队列里有东西，就执行程序，将这个客户端交给一个线程去处理，继续下一个循环
+    // 如果全连接队列空的，那就阻塞在 accept，直到有客户端建立连接
+    while (1) {
+        // 从内核给的全连接队列中去获取客户端地址
+        // 阻塞：如果全连接队列里面没东西，那就阻塞在这里，线程转为阻塞态，程序暂停
+        // 如果全连接队列里面有东西，就返回一个新的 fd 来指向内核中的这个客户端对象，fd 表里添加一个 fd 来指向内核对象
+        int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+
+        // 可以开一个线程去对这个客户端进行服务，也可以直接在这一次循环中进行服务，如果不开线程，那么一次只能服务一个客户端
+        thread t ：{
+            // 开始循环接收数据并处理
+            while (1) {
+                ssize_t recv(int sockfd, void *buf, size_t len, int flags);
+
+                /*
+                处理过程
+                */
+
+                // 循环发送，确保所有数据发送完毕
+                while (1) {
+                    ssize_t send(int sockfd, const void *buf, size_t len, int flags);
+                }
+            }
+            close(); // 关闭 fd 表中指向客户端的那个 fd，在内核中会将这个客户端对象的引用计数-1，减为0之后进入四次挥手，断开连接
+        }
+    }
+
+    close(); // 关闭 fd 表中指向服务端的那个fd
