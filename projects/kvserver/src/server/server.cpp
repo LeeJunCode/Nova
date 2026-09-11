@@ -10,12 +10,76 @@
 #include <cstring>
 #include <cerrno>
 #include <string>
+#include <thread>
+#include <mutex>
+
+
+void handle_client(int client_socketfd, std::string client_info, Store& store, std::mutex& mtx) {
+    std::string querybuf; // 与客户端生命周期一致
+    querybuf.reserve(4096); // 减少二次分配
+
+    while (1) {
+        // recv() 阻塞
+        char buffer[1024]; // 临时 buffer ，用来接收一次发送的数据
+        ssize_t bytes_received = recv(client_socketfd, buffer, sizeof(buffer), 0);
+        if (bytes_received == -1) { // 出错
+            std::cerr << "recv error from " << client_info << ": " << std::error_code(errno, std::generic_category()).message() << std::endl;
+            break;
+        } else if (bytes_received == 0) { // 客户端关闭连接
+            break;
+        }
+
+        // 开始解析命令
+        querybuf.append(buffer, bytes_received); // 追加接收结果
+        std::cout << "From " << client_info << " Received message: " << querybuf << std::endl;
+
+        RESP_MULTI_RESULT result = parse_multi_command(querybuf); // 解析命令
+
+        // 解析完毕开始发送结果
+        // 构建返回结果
+        std::string response;
+        for (const auto& resp_result : result.commands) {
+            std::lock_guard<std::mutex> lk(mtx); // 每一条 store 执行的命令都加锁
+            response += build_reply(resp_result.argv, store);
+        }
+
+        // 解析出现错误，添加错误信息
+        if (result.status == RESP_STATUS::RESP_ERR) {
+            std::string error_msg = "ERR Protocol error: invalid request";
+            response += encode_error(error_msg);
+        }
+
+        // 循环 send 确保发送完毕
+        size_t total_sent = 0;
+        size_t remaining = response.size();
+        while (remaining > 0) {
+            // send()
+            ssize_t bytes_sent = send(client_socketfd, response.data()+total_sent, remaining, 0);
+            if (bytes_sent == -1) {
+                std::cerr << "send error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
+                break;
+            }
+
+            total_sent += bytes_sent;
+            remaining -= bytes_sent;
+        }
+        if (remaining > 0) break; // send() 错误直接断开连接
+        std::cout << "Sent response to " << client_info << ": " << response << std::endl;
+
+        // 解析出现错误，直接断开连接。
+        if (result.status == RESP_STATUS::RESP_ERR) break;
+    }
+
+    // 关闭客户端套接字
+    close(client_socketfd);
+    std::cout << "Client disconnected: " << client_info << std::endl;
+}
 
 int main() {
     // socket()
     int socketfd = socket(AF_INET, SOCK_STREAM, 0);
     if (socketfd == -1) {
-        std::cerr << "socket error: " << strerror(errno) << std::endl;
+        std::cerr << "socket error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
         return 1;
     }
 
@@ -26,15 +90,15 @@ int main() {
     addr.sin_addr.s_addr = INADDR_ANY;
     int bind_result = bind(socketfd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
     if (bind_result == -1) {
-        std::cerr << "bind error: " << strerror(errno) << std::endl;
+        std::cerr << "bind error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
         return 1;
     }
 
     // listen()
-    int queue_size = 0;
+    int queue_size = 128;
     int listen_result = listen(socketfd, queue_size);
     if (listen_result == -1) {
-        std::cerr << "listen error: " << strerror(errno) << std::endl;
+        std::cerr << "listen error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
         return 1;
     } else {
         std::cout << "listening on port 8080..." << std::endl;
@@ -42,6 +106,8 @@ int main() {
 
     // 维护一个kv存储
     Store store;
+    // 维护一个针对 Store 的锁
+    std::mutex mtx;
 
     while(1) {
         // accept() 阻塞
@@ -49,69 +115,17 @@ int main() {
         socklen_t client_addr_len = sizeof(client_addr);
         int client_socketfd = accept(socketfd, reinterpret_cast<struct sockaddr*>(&client_addr), &client_addr_len);
         if (client_socketfd == -1) {
-            std::cerr << "accept error: " << strerror(errno) << std::endl;
+            std::cerr << "accept error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
             continue; // 继续等待下一个连接
         }
 
-        std::cout << "Accepted a connection: " << inet_ntoa(client_addr.sin_addr) << ":" << ntohs(client_addr.sin_port) << std::endl;
+        char ip_buf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, ip_buf, sizeof(ip_buf));
+        std::string client_info = std::string(ip_buf) + ":" + std::to_string(ntohs(client_addr.sin_port));
 
-        std::string querybuf; // 与客户端生命周期一致
-        querybuf.reserve(4096); // 减少二次分配
-
-        while (1) {
-            // recv() 阻塞
-            char buffer[1024]; // 临时 buffer ，用来接收一次发送的数据
-            ssize_t bytes_received = recv(client_socketfd, buffer, sizeof(buffer), 0);
-            if (bytes_received == -1) { // 出错
-                std::cerr << "recv error from " << inet_ntoa(client_addr.sin_addr) << ":" << ntohs(client_addr.sin_port) << ": " << strerror(errno) << std::endl;
-                break;
-            } else if (bytes_received == 0) { // 客户端关闭连接
-                break;
-            }
-
-            // 开始解析命令
-            querybuf.append(buffer, bytes_received); // 追加接收结果
-            std::cout << "From " << inet_ntoa(client_addr.sin_addr) << ":" << ntohs(client_addr.sin_port) << " Received message: " << querybuf << std::endl;
-
-            RESP_MULTI_RESULT result = parse_multi_command(querybuf); // 解析命令
-
-            // 解析完毕开始发送结果
-            // 构建返回结果
-            std::string response;
-            for (const auto& resp_result : result.commands) {
-                response += build_reply(resp_result.argv, store);
-            }
-
-            // 解析出现错误，添加错误信息
-            if (result.status == RESP_STATUS::RESP_ERR) {
-                std::string error_msg = "ERR Protocol error: invalid request";
-                response += encode_error(error_msg);
-            }
-
-            // 循环 send 确保发送完毕
-            size_t total_sent = 0;
-            size_t remaining = response.size();
-            while (remaining > 0) {
-                // send()
-                ssize_t bytes_sent = send(client_socketfd, response.data()+total_sent, remaining, 0);
-                if (bytes_sent == -1) {
-                    std::cerr << "send error: " << strerror(errno) << std::endl;
-                    break;
-                }
-
-                total_sent += bytes_sent;
-                remaining -= bytes_sent;
-            }
-            if (remaining > 0) break; // send() 错误直接断开连接
-            std::cout << "Sent response to " << inet_ntoa(client_addr.sin_addr) << ":" << ntohs(client_addr.sin_port) << ": " << response << std::endl;
-
-            // 解析出现错误，直接断开连接。
-            if (result.status == RESP_STATUS::RESP_ERR) break;
-        }
-
-        // 关闭客户端套接字
-        close(client_socketfd);
-        std::cout << "Client disconnected: " << inet_ntoa(client_addr.sin_addr) << ":" << ntohs(client_addr.sin_port) << std::endl;
+        // 连接到客户端之后，分配一个线程来处理它
+        std::thread t(handle_client, client_socketfd, client_info, std::ref(store), std::ref(mtx));
+        t.detach();
     }
 
     // 关闭服务器套接字
