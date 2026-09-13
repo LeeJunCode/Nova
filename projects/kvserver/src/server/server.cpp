@@ -5,41 +5,99 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
 
 #include <iostream>
 #include <cstring>
 #include <cerrno>
 #include <string>
-#include <thread>
-#include <mutex>
+#include <unordered_map>
 
+struct Client {
+    std::string querybuf; // 接收的数据
+    std::string outbuf; // 待发送的数据
+    std::string peer; // 客户端地址
 
-void handle_client(int client_socketfd, std::string client_info, Store& store, std::mutex& mtx) {
-    std::string querybuf; // 与客户端生命周期一致
-    querybuf.reserve(4096); // 减少二次分配
+    Client(std::string q, std::string c) : querybuf(q), peer(c) {}
+};
+
+void close_client(int client_socketfd, int epfd, std::unordered_map<int, Client>& connections) {
+    auto it = connections.find(client_socketfd);
+    if (it == connections.end()) {
+        return; // 已经关过了
+    }
+    std::cout << "Client disconnected: " << it->second.peer << std::endl;
+
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, client_socketfd, NULL) == -1) {
+        std::cerr << "epoll delete fd error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
+    }
+
+    connections.erase(client_socketfd);
+    close(client_socketfd);
+}
+
+bool flush(int client_socketfd, int epfd, std::unordered_map<int, Client>& connections) {
+    std::string& outbuf = connections.at(client_socketfd).outbuf;
+    struct epoll_event ev;
+    ev.events = EPOLLIN; // 可以读的时候继续通知
+    ev.data.fd = client_socketfd;
+    while (outbuf.size()) {
+        ssize_t n = send(client_socketfd, outbuf.data(), outbuf.size(), MSG_NOSIGNAL);
+        if (n > 0) { // 正常发送，继续发
+            outbuf.erase(0, n); // 截断已经发送的数据
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { // 缓冲区满了，不能发了
+                ev.events = ev.events | EPOLLOUT; // 可以写的时候继续通知
+                break;
+            } else if (errno == EINTR) { // 被打断重传
+                continue;
+            } else { // 出错
+                close_client(client_socketfd, epfd, connections);
+                return false;
+            }
+        }
+    }
+
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, client_socketfd, &ev) == -1) {
+        std::cerr << "epoll MOD fd error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
+    }
+
+    return true;
+}
+
+void handle_read(int client_socketfd, Store& store, int epfd, std::unordered_map<int, Client>& connections) {
+    std::string& querybuf = connections.at(client_socketfd).querybuf;
+    const std::string& peer = connections.at(client_socketfd).peer;
 
     while (1) {
-        // recv() 阻塞
+        // recv() 非阻塞
         char buffer[1024]; // 临时 buffer ，用来接收一次发送的数据
         ssize_t bytes_received = recv(client_socketfd, buffer, sizeof(buffer), 0);
-        if (bytes_received == -1) { // 出错
-            std::cerr << "recv error from " << client_info << ": " << std::error_code(errno, std::generic_category()).message() << std::endl;
-            break;
-        } else if (bytes_received == 0) { // 客户端关闭连接
-            break;
+        if (bytes_received == 0) { // 客户端关闭连接
+            close_client(client_socketfd, epfd, connections);
+            return;
+        } else if (bytes_received == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) { // 数据读完了，此次事件完成,直接返回
+                return ;
+            } else if (errno == EINTR) { // 被打断，重试
+                continue;
+            } else { // 出错
+                std::cerr << "recv error from " << peer << ": " << std::error_code(errno, std::generic_category()).message() << std::endl;
+                close_client(client_socketfd, epfd, connections);
+                return;
+            }
         }
 
         // 开始解析命令
         querybuf.append(buffer, bytes_received); // 追加接收结果
-        std::cout << "From " << client_info << " Received message: " << querybuf << std::endl;
+        std::cout << "From " << peer << " Received message: " << querybuf << std::endl;
 
         RESP_MULTI_RESULT result = parse_multi_command(querybuf); // 解析命令
 
-        // 解析完毕开始发送结果
         // 构建返回结果
         std::string response;
         for (const auto& resp_result : result.commands) {
-            std::lock_guard<std::mutex> lk(mtx); // 每一条 store 执行的命令都加锁
             response += build_reply(resp_result.argv, store);
         }
 
@@ -49,33 +107,40 @@ void handle_client(int client_socketfd, std::string client_info, Store& store, s
             response += encode_error(error_msg);
         }
 
-        // 循环 send 确保发送完毕
-        size_t total_sent = 0;
-        size_t remaining = response.size();
-        while (remaining > 0) {
-            // send()
-            ssize_t bytes_sent = send(client_socketfd, response.data()+total_sent, remaining, 0);
-            if (bytes_sent == -1) {
-                std::cerr << "send error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
-                break;
-            }
-
-            total_sent += bytes_sent;
-            remaining -= bytes_sent;
+        // 一律进待发队列
+        connections.at(client_socketfd).outbuf += response;
+        if (!flush(client_socketfd, epfd, connections)) { // 发送命令结果
+            return; // flush 关闭了连接
         }
-        if (remaining > 0) break; // send() 错误直接断开连接
-        std::cout << "Sent response to " << client_info << ": " << response << std::endl;
 
-        // 解析出现错误，直接断开连接。
-        if (result.status == RESP_STATUS::RESP_ERR) break;
+        // 解析出现错误，断开连接。
+        if (result.status == RESP_STATUS::RESP_ERR) {
+            close_client(client_socketfd, epfd, connections);
+            return;
+        }
+    }
+}
+
+void handle_write(int client_socketfd, int epfd, std::unordered_map<int, Client>& connections) {
+    auto it = connections.find(client_socketfd);
+    if (it == connections.end()) {
+        return; // 连接已经关闭了
     }
 
-    // 关闭客户端套接字
-    close(client_socketfd);
-    std::cout << "Client disconnected: " << client_info << std::endl;
+    flush(client_socketfd, epfd, connections); // 发送 connections 里面的 outbuf
 }
 
 int main() {
+    // 创建一个 epoll 登记表（指的是当前有哪些fd进入了epoll），以及一个就绪链表（指的是当前有哪些fd有事）
+    // 在登记的时候可以设置 ev.events 字段来告诉内核这个fd有什么事情的时候就通知我，即告诉内核fd有什么事情将其挂到就绪链表
+    // ev.events 是一个掩位码
+    // ev.events 含有 EPOLLIN 表示这个fd属于可读状态时通知我
+    // ev.events 含有 EPOLLOUT 表示这个fd属于可写状态时通知我
+    int epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd == -1) {
+        std::cerr << "create epoll error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
+        return 1;
+    }
     // socket()
     int socketfd = socket(AF_INET, SOCK_STREAM, 0);
     if (socketfd == -1) {
@@ -104,28 +169,75 @@ int main() {
         std::cout << "listening on port 8080..." << std::endl;
     }
 
+    // 设置 fd 为非阻塞
+    fcntl(socketfd, F_SETFL, fcntl(socketfd, F_GETFL, 0) | O_NONBLOCK);
+
+    // 启动服务器监听后，将这个 listen fd 增加到 epoll
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = socketfd; // 记录 listen fd
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, socketfd, &ev) == -1) {
+        std::cerr << "epoll add listen fd error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
+        return 1;
+    }
+
     // 维护一个kv存储
     Store store;
-    // 维护一个针对 Store 的锁
-    std::mutex mtx;
 
+    // 维护一个连接队列
+    std::unordered_map<int, Client> connections;
+
+    struct epoll_event events[64]; // 最多服务 64 个连接
     while(1) {
-        // accept() 阻塞
-        struct sockaddr_in client_addr; // 客户端地址
-        socklen_t client_addr_len = sizeof(client_addr);
-        int client_socketfd = accept(socketfd, reinterpret_cast<struct sockaddr*>(&client_addr), &client_addr_len);
-        if (client_socketfd == -1) {
-            std::cerr << "accept error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
-            continue; // 继续等待下一个连接
+        int event_num = epoll_wait(epfd, events, 64, -1); // epoll wait 一直等待
+        if (event_num == -1) {
+            std::cerr << "epoll wait error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
+            continue; // 继续下一轮
         }
 
-        char ip_buf[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, ip_buf, sizeof(ip_buf));
-        std::string client_info = std::string(ip_buf) + ":" + std::to_string(ntohs(client_addr.sin_port));
+        for (int i=0; i<event_num; ++i) {
+            int fd = events[i].data.fd;
+            if (fd == socketfd) { // listenfd 响了，说明有新连接
+                // accept() 阻塞
+                struct sockaddr_in client_addr; // 客户端地址
+                socklen_t client_addr_len = sizeof(client_addr);
+                int client_socketfd = accept(socketfd, reinterpret_cast<struct sockaddr*>(&client_addr), &client_addr_len);
+                if (client_socketfd == -1) {
+                    std::cerr << "accept error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
+                    continue; // 继续等待下一个连接
+                }
 
-        // 连接到客户端之后，分配一个线程来处理它
-        std::thread t(handle_client, client_socketfd, client_info, std::ref(store), std::ref(mtx));
-        t.detach();
+                // 新连接设成非阻塞
+                fcntl(client_socketfd, F_SETFL, fcntl(client_socketfd, F_GETFL, 0) | O_NONBLOCK);
+
+                char ip_buf[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &client_addr.sin_addr, ip_buf, sizeof(ip_buf));
+                std::string peer = std::string(ip_buf) + ":" + std::to_string(ntohs(client_addr.sin_port));
+
+                std::string querybuf; // 与客户端生命周期一致
+                querybuf.reserve(4096); // 减少二次分配
+
+                connections.insert({client_socketfd, Client(querybuf, peer)});
+
+                // epoll 登记新的客户端连接 fd
+                struct epoll_event ev;
+                ev.events = EPOLLIN; // 告诉内核，以后这个fd可读的时候告诉我一声
+                ev.data.fd = client_socketfd;
+                if (epoll_ctl(epfd, EPOLL_CTL_ADD, client_socketfd, &ev) == -1) { // 失败继续下一个连接
+                    std::cerr << "epoll add client fd error: " << std::error_code(errno, std::generic_category()).message() << std::endl;
+                    close(client_socketfd);
+                    connections.erase(client_socketfd);
+                    continue;
+                }
+            } else { // 客户端的 fd 有事了：从fd接收数据或者向fd发送数据，也可能同时进行
+                if (events[i].events & EPOLLIN) { // 从fd接收数据
+                    handle_read(fd, store, epfd, connections);
+                }
+                if (events[i].events & EPOLLOUT) { // 向fd发送数据
+                    handle_write(fd, epfd, connections);
+                }
+            }
+        }
     }
 
     // 关闭服务器套接字
